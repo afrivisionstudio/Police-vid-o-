@@ -117,15 +117,6 @@ const log = m => {
   el.textContent = `[${t}] ${m}\n` + el.textContent;
   checkErrors();
 };
-const blobToB64 = blob => new Promise(res => {
-  const r = new FileReader(); r.onload = () => res(r.result.split(',')[1]);
-  r.readAsDataURL(blob);
-});
-const b64ToBlob = (b64, type='image/png') => {
-  const bin = atob(b64); const arr = new Uint8Array(bin.length);
-  for (let i=0;i<bin.length;i++) arr[i] = bin.charCodeAt(i);
-  return new Blob([arr], {type});
-};
 
 function saveKey() {
   const k = document.getElementById('key').value.trim();
@@ -137,7 +128,6 @@ function refreshKeyStatus() {
     k ? `✓ clé enregistrée (${k.slice(0,6)}…)` : '⚠️ aucune clé enregistrée';
 }
 
-// Fonction API générique avec Retry
 async function api(path, body, method='POST', retries=3) {
   const key = localStorage.getItem('agnes_key');
   if (!key) throw new Error('clé API manquante');
@@ -149,8 +139,8 @@ async function api(path, body, method='POST', retries=3) {
         body: body ? JSON.stringify(body) : undefined
       });
       
-      if (res.status === 429 || res.status === 503) {
-        log(`⏳ Limite ou serveur occupé (${res.status}). Pause de 60s...`);
+      if (res.status === 429) {
+        log(`⏳ Limite atteinte (429). Pause de 60s...`);
         await sleep(60000);
         continue;
       }
@@ -158,18 +148,16 @@ async function api(path, body, method='POST', retries=3) {
       if (!res.ok) {
         const errText = await res.text();
         if (res.status >= 500 && attempt < retries) {
-          log(`⚠️ Serveur Agnes occupé (${res.status}). Nouvelle tentative dans 15s...`);
-          await sleep(15000);
+          log(`⚠️ Serveur Agnes occupé (500). Nouvelle tentative dans 10s...`);
+          await sleep(10000);
           continue;
         }
         throw new Error(`${res.status} · ${errText.slice(0,100)}`);
       }
-      
       return await res.json();
     } catch (e) {
       if (e.message.includes('Failed to fetch') && attempt < retries) {
-        log(`⚠️ Erreur réseau. Nouvelle tentative dans 10s...`);
-        await sleep(10000);
+        await sleep(5000);
         continue;
       }
       throw e;
@@ -184,6 +172,7 @@ function buildPrompt(shot) {
   return `${STYLE}\n\n${p}`;
 }
 
+// 1. GÉNÉRATION IMAGE (Demande une URL publique)
 async function genImage(shot) {
   const st = STATE[shot.id];
   st.status = 'image'; st.error = null; render();
@@ -191,15 +180,12 @@ async function genImage(shot) {
     const d = await api('/images/generations', {
       model: 'agnes-image-2.1-flash',
       prompt: buildPrompt(shot),
-      size: '720x1280', n: 1, response_format: 'b64_json'
+      size: '720x1280', n: 1, 
+      response_format: 'url' // <-- IMPORTANT : On demande l'URL au lieu du base64
     });
-    const item = d.data[0];
-    const blob = item.b64_json
-      ? b64ToBlob(item.b64_json)
-      : await (await fetch(item.url)).blob();
-    st.imageBlob = blob;
-    st.imageUrl = URL.createObjectURL(blob);
-    log(`✓ image plan ${shot.id}`);
+    
+    st.imageUrl = d.data[0].url; // On garde l'URL pour l'API vidéo
+    log(`✓ image plan ${shot.id} générée`);
     render();
     return true;
   } catch(e) {
@@ -210,33 +196,31 @@ async function genImage(shot) {
   }
 }
 
-// --- VIDÉO AVEC NOUVEAU MODÈLE AGNES-V2.5 ---
+// 2. GÉNÉRATION VIDÉO (Selon la doc officielle)
 async function genVideo(shot) {
   const st = STATE[shot.id];
   st.status = 'video'; render();
   try {
-    const imgB64 = await blobToB64(st.imageBlob);
-    
-    // 1. Création de la tâche (Nouveaux paramètres Agnes 2.5)
+    // A. Création de la tâche
     const job = await api('/videos', {
-      model: 'agnes-video-2.5',       // Le nouveau modèle
+      model: 'agnes-video-2.5',
       prompt: buildPrompt(shot),
-      mode: 'keyframe',                // Mode Image -> Vidéo
-      first_frame: `data:image/png;base64,${imgB64}`, // Image encodée
-      seconds: '5',                    // Durée
-      size: '720P',
-      aspect_ratio: '9:16'
+      mode: 'keyframe', 
+      first_frame: st.imageUrl, // L'URL publique de l'image
+      seconds: "5",
+      size: "720P",
+      aspect_ratio: "9:16"
     });
 
-    const videoId = job.video_id || job.id;
+    const videoId = job.video_id;
     if (!videoId) throw new Error("Pas de video_id retourné");
     
-    log(`⏳ vidéo plan ${shot.id} en file d'attente...`);
+    log(`⏳ vidéo plan ${shot.id} en cours (id: ${videoId.slice(0,8)}...)`);
 
-    // 2. Suivi de la tâche (Nouvel endpoint de polling)
+    // B. Suivi de la tâche (URL spécifique sans /v1/)
     let tries = 0;
-    while (tries < 30) {
-      await sleep(15000); // Vérifier toutes les 15 sec (recommandé pour 2.5)
+    while (tries < 60) {
+      await sleep(5000); // On vérifie toutes les 5 secondes
       
       const url = `https://apihub.agnes-ai.com/agnesapi?video_id=${videoId}&model_name=agnes-video-2.5`;
       const resPoll = await fetch(url, {
@@ -244,20 +228,22 @@ async function genVideo(shot) {
         headers: { 'Authorization': `Bearer ${localStorage.getItem('agnes_key')}` }
       });
 
-      if (!resPoll.ok) {
-        // Si erreur pendant le polling, on attend un peu et on continue
-        tries++;
+      if (resPoll.status === 429) {
+        await sleep(10000);
         continue;
+      }
+
+      if (!resPoll.ok) {
+        tries++; continue;
       }
       
       const d = await resPoll.json();
-      const s = (d.status || '').toLowerCase();
       
-      if (['completed', 'succeeded', 'done', 'ready'].includes(s)) {
-        const videoUrl = d.url || d.video_url || (d.output && d.output.url);
-        if (!videoUrl) throw new Error("Vidéo terminée mais URL manquante");
+      if (d.status === 'completed') {
+        if (!d.url) throw new Error("Vidéo terminée mais URL manquante");
         
-        const blob = await (await fetch(videoUrl)).blob();
+        // On télécharge la vidéo en arrière-plan pour pouvoir la lire
+        const blob = await (await fetch(d.url)).blob();
         st.videoBlob = blob;
         st.videoUrl = URL.createObjectURL(blob);
         st.status = 'done';
@@ -266,14 +252,14 @@ async function genVideo(shot) {
         return true;
       }
       
-      if (['failed', 'error'].includes(s)) {
-        throw new Error('Tâche échouée côté serveur Agnes');
+      if (d.status === 'failed') {
+        throw new Error(d.error?.message || 'Échec côté serveur');
       }
       
       tries++;
-      if (tries % 2 === 0) log(`… plan ${shot.id} toujours en cours de rendu...`);
+      if (tries % 4 === 0) log(`… plan ${shot.id} : ${d.progress || 0}%`);
     }
-    throw new Error('Délai dépassé (plus de 7 minutes)');
+    throw new Error('Délai dépassé (5 minutes)');
   } catch(e) {
     st.status = 'error'; st.error = e.message;
     log(`✗ vidéo ${shot.id} : ${e.message}`);
@@ -284,8 +270,8 @@ async function genVideo(shot) {
 
 async function runShot(shot) {
   const st = STATE[shot.id];
-  if (!st.imageBlob) { if (!(await genImage(shot))) return; }
-  await sleep(3000); 
+  if (!st.imageUrl) { if (!(await genImage(shot))) return; }
+  await sleep(2000); 
   await genVideo(shot);
 }
 
@@ -295,7 +281,7 @@ async function generateAll() {
   for (const shot of SHOTS) {
     if (STATE[shot.id].status === 'done') continue;
     await runShot(shot);
-    await sleep(5000); 
+    await sleep(3000); 
   }
   btn.disabled = false; btn.textContent = '▶ Générer tout';
   log('🏁 Terminé.');
@@ -305,12 +291,11 @@ async function retryErrors() {
   const btn = document.getElementById('btnRetry');
   btn.disabled = true; btn.textContent = '⏳...';
   const errors = SHOTS.filter(s => STATE[s.id].status === 'error');
-  log(`↻ Relance de ${errors.length} plans en erreur...`);
+  log(`↻ Relance de ${errors.length} plans...`);
   for (const shot of errors) {
-    // On force la regénération de l'image si elle a échoué, sinon on garde l'image
-    if (!STATE[shot.id].imageBlob) await genImage(shot);
+    if (!STATE[shot.id].imageUrl) await genImage(shot);
     await genVideo(shot);
-    await sleep(5000);
+    await sleep(3000);
   }
   btn.disabled = false; btn.textContent = '↻ Réessayer les erreurs';
 }
@@ -331,7 +316,6 @@ function downloadShot(shot) {
   const st = STATE[shot.id];
   const n = `ep01_plan_${String(shot.id).padStart(2,'0')}`;
   if (st.videoBlob) download(st.videoBlob, n + '.mp4');
-  else if (st.imageBlob) download(st.imageBlob, n + '.png');
 }
 async function downloadAll() {
   for (const shot of SHOTS) {
@@ -362,7 +346,7 @@ function render() {
         <span class="badge s-${st.status}">${label}${err}</span>
         <div class="actions">
           <button onclick="runShot(SHOTS[${s.id-1}])">${st.status==='done'?'↻ régénérer':'▶ générer'}</button>
-          ${st.videoBlob||st.imageBlob
+          ${st.videoBlob
             ? `<button class="secondary" onclick="downloadShot(SHOTS[${s.id-1}])">⬇ télécharger</button>`
             : ''}
         </div>
