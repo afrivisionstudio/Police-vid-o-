@@ -172,7 +172,6 @@ function buildPrompt(shot) {
   return `${STYLE}\n\n${p}`;
 }
 
-// 1. GÉNÉRATION IMAGE (Demande une URL publique)
 async function genImage(shot) {
   const st = STATE[shot.id];
   st.status = 'image'; st.error = null; render();
@@ -181,10 +180,10 @@ async function genImage(shot) {
       model: 'agnes-image-2.1-flash',
       prompt: buildPrompt(shot),
       size: '720x1280', n: 1, 
-      response_format: 'url' // <-- IMPORTANT : On demande l'URL au lieu du base64
+      response_format: 'url'
     });
     
-    st.imageUrl = d.data[0].url; // On garde l'URL pour l'API vidéo
+    st.imageUrl = d.data[0].url;
     log(`✓ image plan ${shot.id} générée`);
     render();
     return true;
@@ -196,17 +195,15 @@ async function genImage(shot) {
   }
 }
 
-// 2. GÉNÉRATION VIDÉO (Selon la doc officielle)
 async function genVideo(shot) {
   const st = STATE[shot.id];
   st.status = 'video'; render();
   try {
-    // A. Création de la tâche
     const job = await api('/videos', {
-      model: 'agnes-video-2.5',
+      model: 'agnes-video-2.5-flash', // MODIFIÉ : modèle gratuit
       prompt: buildPrompt(shot),
       mode: 'keyframe', 
-      first_frame: st.imageUrl, // L'URL publique de l'image
+      first_frame: st.imageUrl,
       seconds: "5",
       size: "720P",
       aspect_ratio: "9:16"
@@ -217,12 +214,12 @@ async function genVideo(shot) {
     
     log(`⏳ vidéo plan ${shot.id} en cours (id: ${videoId.slice(0,8)}...)`);
 
-    // B. Suivi de la tâche (URL spécifique sans /v1/)
     let tries = 0;
     while (tries < 60) {
-      await sleep(5000); // On vérifie toutes les 5 secondes
+      await sleep(5000);
       
-      const url = `https://apihub.agnes-ai.com/agnesapi?video_id=${videoId}&model_name=agnes-video-2.5`;
+      // MODIFIÉ : model_name=agnes-video-2.5-flash
+      const url = `https://apihub.agnes-ai.com/agnesapi?video_id=${videoId}&model_name=agnes-video-2.5-flash`;
       const resPoll = await fetch(url, {
         method: 'GET',
         headers: { 'Authorization': `Bearer ${localStorage.getItem('agnes_key')}` }
@@ -242,7 +239,6 @@ async function genVideo(shot) {
       if (d.status === 'completed') {
         if (!d.url) throw new Error("Vidéo terminée mais URL manquante");
         
-        // On télécharge la vidéo en arrière-plan pour pouvoir la lire
         const blob = await (await fetch(d.url)).blob();
         st.videoBlob = blob;
         st.videoUrl = URL.createObjectURL(blob);
